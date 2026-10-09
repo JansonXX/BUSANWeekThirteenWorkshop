@@ -1,0 +1,339 @@
+---
+---
+title: "Employee Attrition Analysis"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+---
+
+```{r}
+# 1. Setup
+
+library(tidyverse); library(caret); library(pROC); library(rpart); library(rpart.plot)
+```
+
+
+```{r}
+# 2. Load and inspect
+df <- read_csv("week13_employee.csv")
+glimpse(df)
+summary(df)
+colSums(is.na(df))
+
+```
+
+
+```{r}
+# 3. Clean
+# Columns with only one value (likely FTE, StandardHours) carry no information
+df %>% summarise(across(everything(), n_distinct)) %>%
+  pivot_longer(everything()) %>% filter(value == 1)
+df <- df %>% select(-FTE, -StandardHours)
+df <- df %>%
+  mutate(across(where(is.character), as.factor),
+         Attrition = factor(Attrition, levels = c("No", "Yes")))
+```
+
+
+
+
+
+```{r}
+# 4. Exploratory analysis
+df %>% group_by(Department) %>%
+  summarise(n = n(), attrition_rate = mean(Attrition == "Yes"))
+
+ggplot(df, aes(JobRole, fill = Attrition)) +
+  geom_bar(position = "fill") + coord_flip() +
+  labs(y = "Proportion")
+
+ggplot(df, aes(Attrition, YearsAtCompany, fill = Attrition)) + geom_boxplot()
+
+```
+
+
+
+```{r}
+# 5. Hypothesis tests
+t.test(Age ~ Attrition, data = df)
+chisq.test(table(df$BusinessTravel, df$Attrition))
+```
+
+
+```{r}
+# 6. Logistic regression
+set.seed(123)
+idx   <- createDataPartition(df$Attrition, p = 0.7, list = FALSE)
+train <- df[idx, ]
+test  <- df[-idx, ]
+
+fit <- glm(Attrition ~ ., data = train, family = binomial)
+summary(fit)
+exp(cbind(OR = coef(fit), confint.default(fit)))  
+
+# odds ratios
+or_table <- broom::tidy(fit, exponentiate = TRUE, conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  transmute(variable = term,
+            OR       = round(estimate, 3),
+            CI_low   = round(conf.low, 3),
+            CI_high  = round(conf.high, 3),
+            p_value  = round(p.value, 4)) %>%
+  arrange(p_value)
+
+or_table
+
+```
+
+
+
+
+```{r}
+# 7. Evaluate
+prob <- predict(fit, test, type = "response")
+pred <- factor(ifelse(prob > 0.5, "Yes", "No"), levels = c("No", "Yes"))
+confusionMatrix(pred, test$Attrition, positive = "Yes")
+
+roc_obj <- roc(test$Attrition, prob)
+plot(roc_obj); auc(roc_obj)
+
+# Lower cutoff catches more leavers (trade-off: more false alarms)
+pred30 <- factor(ifelse(prob > 0.3, "Yes", "No"), levels = c("No", "Yes"))
+confusionMatrix(pred30, test$Attrition, positive = "Yes")
+
+# AUC on the training data, to compare with the test AUC
+auc(roc(train$Attrition, predict(fit, train, type = "response")))
+```
+
+
+
+
+```{r}
+# 8. Optional: decision tree for interpretability
+tree <- rpart(Attrition ~ ., data = train, method = "class")
+rpart.plot(tree)
+
+tree_pred <- predict(tree, test, type = "class")
+confusionMatrix(tree_pred, test$Attrition, positive = "Yes")
+
+tree_prob <- predict(tree, test, type = "prob")[, "Yes"]
+auc(roc(test$Attrition, tree_prob))
+
+# Which variables matter most
+tree$variable.importance
+
+```
+
+```{r}
+# tidymodels-setup
+install.packages(c("tidymodels", "skimr", "corrr", "vip", "glmnet", "ranger", "xgboost"))
+```
+```
+```{r}
+
+```
+
+```{r}
+# prep-checks
+# Missing values and variable types
+skim(df)
+
+# Class imbalance
+df %>% count(Attrition) %>% mutate(prop = round(n / sum(n), 3))
+
+# Variables with very few distinct values
+df %>%
+  summarise(across(everything(), n_distinct)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "n_unique") %>%
+  arrange(n_unique)
+
+# Skewness of numeric variables
+skew <- function(x) mean((x - mean(x))^3) / sd(x)^3
+df %>%
+  select(where(is.numeric)) %>%
+  summarise(across(everything(), skew)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "skewness") %>%
+  arrange(desc(abs(skewness)))
+
+# Highly correlated numeric predictors
+df %>%
+  select(where(is.numeric)) %>%
+  correlate() %>%
+  stretch() %>%
+  filter(abs(r) > 0.7, as.character(x) < as.character(y)) %>%
+  arrange(desc(abs(r)))
+```
+
+```{r eda}
+df %>%
+  group_by(Department) %>%
+  summarise(n = n(), attrition_rate = round(mean(Attrition == "Yes"), 3))
+
+ggplot(df, aes(JobRole, fill = Attrition)) +
+  geom_bar(position = "fill") +
+  coord_flip() +
+  labs(y = "Proportion")
+
+num_vars <- df %>%
+  select(where(is.numeric)) %>%
+  select(where(~ n_distinct(.x) > 1)) %>%
+  names()
+
+df %>%
+  select(Attrition, all_of(num_vars)) %>%
+  pivot_longer(-Attrition) %>%
+  ggplot(aes(Attrition, value, fill = Attrition)) +
+  geom_boxplot(show.legend = FALSE) +
+  facet_wrap(~name, scales = "free_y")
+```
+
+```{r bivariate}
+# Numeric variables: Wilcoxon test
+map_dfr(num_vars, ~ tibble(
+  variable = .x,
+  p_value  = wilcox.test(df[[.x]] ~ df$Attrition)$p.value
+)) %>%
+  arrange(p_value)
+
+# Categorical variables: chi-square test
+cat_vars <- df %>% select(where(is.factor), -Attrition) %>% names()
+
+map_dfr(cat_vars, ~ tibble(
+  variable = .x,
+  p_value  = suppressWarnings(chisq.test(table(df[[.x]], df$Attrition))$p.value)
+)) %>%
+  arrange(p_value)
+```
+```
+```{r}
+# split
+set.seed(123)
+split <- initial_split(df, prop = 0.8, strata = Attrition)
+train <- training(split)
+test  <- testing(split)
+
+folds <- vfold_cv(train, v = 5, strata = Attrition)
+```
+
+```{r recipes}
+rec_base <- recipe(Attrition ~ ., data = train) %>%
+  step_zv(all_predictors()) %>%
+  step_YeoJohnson(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+rec_corr <- rec_base %>%
+  step_corr(all_numeric_predictors(), threshold = 0.8)
+
+rec_pca <- rec_base %>%
+  step_pca(all_numeric_predictors(), threshold = 0.90)
+```
+
+```{r models}
+logit_spec <- logistic_reg() %>%
+  set_engine("glm")
+
+glmnet_spec <- logistic_reg(penalty = tune(), mixture = tune()) %>%
+  set_engine("glmnet")
+
+rf_spec <- rand_forest(trees = 500, mtry = tune(), min_n = tune()) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification")
+
+xgb_spec <- boost_tree(trees = tune(), tree_depth = tune(), learn_rate = tune()) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+```
+
+```{r tuning}
+# Takes several minutes
+metrics <- metric_set(roc_auc, pr_auc, sens, spec, f_meas)
+
+wf_set <- workflow_set(
+  preproc = list(base = rec_base, corr = rec_corr, pca = rec_pca),
+  models  = list(logit = logit_spec, glmnet = glmnet_spec,
+                 rf = rf_spec, xgb = xgb_spec),
+  cross = TRUE
+)
+
+res <- wf_set %>%
+  workflow_map(
+    "tune_grid",
+    resamples = folds,
+    grid      = 10,
+    metrics   = metrics,
+    control   = control_grid(save_workflow = TRUE),
+    seed      = 123,
+    verbose   = TRUE
+  )
+```
+
+```{r compare}
+autoplot(res, metric = "roc_auc")
+
+rank_results(res, rank_metric = "roc_auc", select_best = TRUE) %>%
+  filter(.metric == "roc_auc") %>%
+  select(wflow_id, mean, std_err, rank)
+```
+```
+```{r}
+ best-model
+best_id <- rank_results(res, rank_metric = "roc_auc", select_best = TRUE) %>%
+  filter(.metric == "roc_auc") %>%
+  slice(1) %>%
+  pull(wflow_id)
+best_id
+
+best_params <- extract_workflow_set_result(res, best_id) %>%
+  select_best(metric = "roc_auc")
+
+final_wf <- extract_workflow(res, best_id) %>%
+  finalize_workflow(best_params)
+
+final_fit <- last_fit(final_wf, split, metrics = metrics)
+collect_metrics(final_fit)
+
+preds <- collect_predictions(final_fit)
+conf_mat(preds, truth = Attrition, estimate = .pred_class)
+roc_curve(preds, truth = Attrition, .pred_Yes) %>% autoplot()
+```
+
+```{r threshold}
+preds_30 <- preds %>%
+  mutate(pred_30 = factor(if_else(.pred_Yes > 0.30, "Yes", "No"),
+                          levels = c("Yes", "No")))
+
+conf_mat(preds_30, truth = Attrition, estimate = pred_30)
+sens(preds_30, truth = Attrition, estimate = pred_30)
+spec(preds_30, truth = Attrition, estimate = pred_30)
+```
+
+```{r fit-check}
+# Underfitting / overfitting check
+fit_train <- fit(final_wf, train)
+
+train_pred <- bind_cols(train %>% select(Attrition),
+                        predict(fit_train, train, type = "prob"))
+train_auc <- roc_auc(train_pred, Attrition, .pred_Yes)$.estimate
+
+cv_auc <- rank_results(res, rank_metric = "roc_auc", select_best = TRUE) %>%
+  filter(wflow_id == best_id, .metric == "roc_auc") %>%
+  pull(mean)
+
+test_auc <- collect_metrics(final_fit) %>%
+  filter(.metric == "roc_auc") %>%
+  pull(.estimate)
+
+tibble(train = train_auc, cross_validation = cv_auc, test = test_auc)
+```
+
+```{r importance}
+final_fit %>% extract_fit_parsnip() %>% vip(num_features = 15)
+```
+```
+
+
+
+
+
